@@ -1,50 +1,39 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# 愛媛県 全域：犯罪/異常行動 警戒予測（Streamlit 完成版 / サイドバーUI）
-# - サイドバーUIにロールバック（操作の一貫性・安定性）
-# - mgpn 月齢API（v2 JSON優先 → v3 フォールバック）を堅牢化（Accept/timeout/retry/キャッシュ）
-# - CSVの住所をジオコーディング（Nominatim/Overpass＋ディスクキャッシュ）し、地図に実点表示
-# - 2019オープンデータの概位置（市町村中心＋ジッター）表示も併用
-# - 指定地点近傍の「犯罪が起こりやすそうなPOI」をOverpass(GEO/NET)から取得しポインティング
-# - 将来30日で「犯罪スコアが最大となりそうな日」を月齢＋季節・曜日ヒューリスティックで予測
-# - st.experimental_rerun → st.rerun に置換（AttributeError対策）
-# - st_folium の引数差異（returned_objects/returns）を吸収するラッパで互換表示
+# 愛媛県 全域：犯罪/異常行動 警戒予測（Streamlit 完成版 / 全機能統合）
+# - サイドバーUI（操作安定）
+# - mgpn 月齢API v2(JSON) 優先 → v3 フォールバック（Accept/Retry/Cache 30分）
+# - 2019年愛媛県オープンデータ（手口別CSV）を自動検出・統合・可視化（維持）
+# - 住所CSVをジオコーディング（Nominatim）→ 地図へ実点表示（/mnt/data にキャッシュ）
+# - Overpassから近傍POIを取得（駅/バス停/駐輪場/コンビニ/駐車場/公園/ATM 等）
+# - 将来30日で「最大リスク日」（21:00評価）を月齢中心に推定
+# - 地図描画は st_folium の互換＆HTML埋め込みでフェイルセーフ（必ず画面に表示）
+# - DuplicateWidgetID 回避：各ウィジェット key 固定、st.rerun() 使用
 # ============================================================
 
-import os
-import re
-import io
-import glob
-import time
+import os, re, io, glob, time, json
 from datetime import datetime, timedelta, timezone
-import json
-import math
-import chardet
-import requests
-import numpy as np
-import pandas as pd
+import chardet, requests, numpy as np, pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from streamlit_folium import st_folium
 import streamlit_folium as stf
 import folium
 from folium.plugins import MiniMap, MousePosition, MeasureControl, Fullscreen, MarkerCluster
-
-# LocateControl が無い folium 版への対応
 try:
-    from folium.plugins import LocateControl  # type: ignore
+    from folium.plugins import LocateControl  # 一部folium版に無い
     HAS_LOCATE = True
 except Exception:
     HAS_LOCATE = False
 
+# ---------------- Basic ----------------
 JST = timezone(timedelta(hours=9))
 APP_TITLE = "愛媛県 警戒予測モニター"
-EHIME_CENTER_LAT = 33.8416
-EHIME_CENTER_LON = 132.7661
+EHIME_CENTER = (33.8416, 132.7661)
+INIT_LAT, INIT_LON = 34.27717, 133.20986
 EHIME_BBOX = {"min_lat": 32.8, "max_lat": 34.6, "min_lon": 131.8, "max_lon": 134.0}
-INIT_LAT = 34.27717
-INIT_LON = 133.20986
 DATA_GLOBS = ["./ehime_2019*.csv", "./data/ehime_2019*.csv", "/mnt/data/ehime_2019*.csv"]
-GEOCODE_CACHE_PATH = "/mnt/data/geocode_cache.parquet"
+GEOCODE_CACHE = "/mnt/data/geocode_cache.parquet"
 
 MUNI_CENTER = {
     "松山市": (33.839, 132.765), "今治市": (34.066, 132.997), "新居浜市": (33.960, 133.283),
@@ -67,7 +56,7 @@ CTYPE_STYLE = {
     "不明": ("gray", "glyphicon-question-sign"),
 }
 
-# ------------ Secrets / API Keys ------------
+# ---------------- Secrets ----------------
 try:
     WEATHERAPI_KEY = st.secrets.get("weatherapi", {}).get("api_key", "")
     OPENWEATHER_KEY = st.secrets.get("openweather", {}).get("api_key", "")
@@ -77,7 +66,7 @@ except Exception:
     WEATHERAPI_KEY = OPENWEATHER_KEY = GEMINI_KEY = ""
     GEMINI_MODEL = "gemini-2.5-flash"
 
-# ------------ CSS ------------
+# ---------------- CSS ----------------
 DRAMA_CSS = """
 <style>
 .main, .stApp { background: #0b0f14; color: #e6eef7; }
@@ -98,7 +87,7 @@ section.main > div.block-container { padding-top: .8rem; padding-bottom: 1.0rem;
 </style>
 """
 
-# ------------ Utils ------------
+# ---------------- Utils ----------------
 
 def read_csv_robust(path: str) -> pd.DataFrame:
     with open(path, "rb") as f:
@@ -182,15 +171,15 @@ def load_all_crime_2019(data_globs: list[str] | None = None) -> pd.DataFrame | N
         frames.append(df[["date", "municipality", "address", "ctype"]])
     return pd.concat(frames, ignore_index=True)
 
-# ------------ Weather ------------
+# ---------------- Weather ----------------
 
 def get_weather_weatherapi(lat, lon):
     try:
         if not WEATHERAPI_KEY:
             return None
-        base = "https://api.weatherapi.com/v1"
+        base = "https://api.weatherapi.com/v1/current.json"
         params = {"key": WEATHERAPI_KEY, "q": f"{lat},{lon}", "aqi": "no"}
-        r = requests.get(f"{base}/current.json", params=params, timeout=10)
+        r = requests.get(base, params=params, timeout=10)
         r.raise_for_status()
         curr = r.json()
         return {
@@ -234,7 +223,7 @@ def get_weather(lat, lon):
         w = {"provider": "dummy", "temp_c": 26.0, "humidity": 70, "condition": "晴れ", "precip_mm": 0.0, "wind_kph": 8.0}
     return w
 
-# ------------ mgpn 月齢API（v2 JSON優先 / v3 フォールバック / retry+cache） ------------
+# ---------------- mgpn（月齢） v2 JSON → v3 ---------------
 
 def _extract_moonage(payload) -> float | None:
     if payload is None:
@@ -255,22 +244,14 @@ def _phase_text_from_age(age: float | None) -> str | None:
     if age is None:
         return None
     a = age % 29.53
-    if a < 1.0:
-        return "新月"
-    if a < 6.0:
-        return "三日月（若月）"
-    if a < 8.9:
-        return "上弦前後"
-    if a < 13.5:
-        return "十三夜～満月前"
-    if a < 16.0:
-        return "満月前後"
-    if a < 21.0:
-        return "満月後～下弦前"
-    if a < 23.5:
-        return "下弦前後"
-    if a < 28.0:
-        return "有明月（残月）"
+    if a < 1.0: return "新月"
+    if a < 6.0: return "三日月（若月）"
+    if a < 8.9: return "上弦前後"
+    if a < 13.5: return "十三夜～満月前"
+    if a < 16.0: return "満月前後"
+    if a < 21.0: return "満月後～下弦前"
+    if a < 23.5: return "下弦前後"
+    if a < 28.0: return "有明月（残月）"
     return "新月に近い"
 
 
@@ -280,18 +261,16 @@ def _mgpn_call(url: str, params: dict) -> dict | None:
         try:
             r = requests.get(url, params=params, headers=headers, timeout=8)
             r.raise_for_status()
-            # 一部環境で text/csv が返ることがある → JSONとして読めない場合は行頭/末尾を整形
             ct = r.headers.get("Content-Type", "")
-            if "json" not in ct:
-                # JSONが改行で壊れているケースを吸収
+            if "json" in ct:
+                payload = r.json()
+            else:
+                # JSONでない場合はテキストから復旧を試みる
                 txt = r.text.strip()
                 try:
                     payload = json.loads(txt)
                 except Exception:
-                    # CSV的に見える場合は v3 へ任せる
                     payload = None
-            else:
-                payload = r.json()
             if payload is None:
                 raise ValueError("mgpn: empty payload")
             age = _extract_moonage(payload)
@@ -304,8 +283,7 @@ def _mgpn_call(url: str, params: dict) -> dict | None:
             continue
     return None
 
-
-@st.cache_data(show_spinner=False, ttl=60 * 30)
+@st.cache_data(show_spinner=False, ttl=60*30)
 def get_mgpn_moon(lat: float, lon: float, dt_jst: datetime) -> dict | None:
     t = dt_jst.strftime("%Y-%m-%dT%H:%M")
     p = {"time": t, "lat": f"{lat:.6f}", "lon": f"{lon:.6f}", "loop": 1, "interval": 0}
@@ -324,7 +302,7 @@ def is_full_moon_like_text(phase_text: str | None, age: float | None) -> bool:
         return 13.3 <= a <= 16.3
     return False
 
-# ------------ Risk Score ------------
+# ---------------- Risk Score ----------------
 
 def compute_risk_score(weather: dict, now_dt: datetime, all_df: pd.DataFrame | None, moon_info: dict | None) -> dict:
     score = 0.0
@@ -333,6 +311,7 @@ def compute_risk_score(weather: dict, now_dt: datetime, all_df: pd.DataFrame | N
     precip = float(weather.get("precip_mm", 0.0))
     humidity = float(weather.get("humidity", 60))
     cond = str(weather.get("condition", ""))
+
     if temp >= 32: add = 42
     elif temp >= 30: add = 36
     elif temp >= 27: add = 28
@@ -341,16 +320,22 @@ def compute_risk_score(weather: dict, now_dt: datetime, all_df: pd.DataFrame | N
     else: add = 0
     score += add
     if add > 0: reasons.append(f"気温{temp:.0f}℃:+{add}")
+
     if precip >= 10: score -= 20; reasons.append("強い降雨:-20")
     elif precip >= 1: score -= 8; reasons.append("降雨あり:-8")
+
     hour = now_dt.hour
     if 20 <= hour <= 23 or 0 <= hour <= 4: score += 15; reasons.append("夜間:+15")
     elif 17 <= hour < 20: score += 7; reasons.append("夕方:+7")
+
     if now_dt.weekday() in (4, 5): score += 6; reasons.append("週末(+金土):+6")
+
     moon_age = moon_info.get("moon_age") if moon_info else None
     moon_phase_text = moon_info.get("phase_text") if moon_info else None
     if is_full_moon_like_text(moon_phase_text, moon_age): score += 5; reasons.append("満月相当:+5")
+
     if humidity >= 80: score += 3; reasons.append("高湿度:+3")
+
     if all_df is not None and not all_df.empty:
         sub = all_df.copy(); sub["month"] = sub["date"].dt.month
         month_ratio = len(sub[sub["month"] == now_dt.month]) / max(1, len(sub))
@@ -361,58 +346,73 @@ def compute_risk_score(weather: dict, now_dt: datetime, all_df: pd.DataFrame | N
             outdoor_like = float(top_types.get("ひったくり",0)+top_types.get("車上ねらい",0)+top_types.get("自転車盗",0)+top_types.get("オートバイ盗",0))
             if outdoor_like >= 0.45: score += 5; reasons.append("2019傾向(屋外系多):+5")
             elif outdoor_like >= 0.30: score += 2; reasons.append("2019傾向(屋外系やや多):+2")
+
     score = float(np.clip(score, 0, 100))
     if score < 25: level, color = "Low", "#0aa0ff"
     elif score < 50: level, color = "Moderate", "#ffd033"
     elif score < 75: level, color = "High", "#ff7f2a"
     else: level, color = "Very High", "#ff2a2a"
+
     return {"score": round(score,1), "level": level, "color": color, "reasons": reasons,
             "moon_phase": moon_phase_text, "moon_age": moon_age,
             "temp_c": temp, "humidity": humidity, "precip_mm": precip, "condition": cond}
 
-# ------------ st_folium 互換ラッパ ------------
+# ---------------- st_folium 互換＆フェイルセーフ ----------------
 
-def render_st_folium(map_obj, key: str, height: int, need_click: bool):
+def render_map_failsafe(map_obj, key: str, height: int, need_click: bool):
+    # 1) 新しめ（returned_objects）
     try:
         return st_folium(map_obj, height=height, returned_objects=["last_clicked"] if need_click else [], key=key)
     except TypeError:
-        try:
-            return st_folium(map_obj, height=height, returns=["last_clicked"] if need_click else None, key=key)
-        except TypeError:
-            return st_folium(map_obj, height=height, key=key)
+        pass
+    # 2) 旧版（returns）
+    try:
+        return st_folium(map_obj, height=height, returns=["last_clicked"] if need_click else None, key=key)
+    except TypeError:
+        pass
+    # 3) さらに旧版（引数無し）
+    try:
+        return st_folium(map_obj, height=height, key=key)
+    except Exception:
+        pass
+    # 4) 最終手段：HTMLを直接埋め込み
+    try:
+        html = map_obj.get_root().render()
+        components.html(html, height=height)
+        return {}
+    except Exception:
+        st.error("地図コンポーネントの描画に失敗しました。")
+        return {}
 
-# ------------ ジオコーディング（Nominatim） ------------
+# ---------------- Geocoding (Nominatim) ----------------
 
 def _load_geocode_cache() -> pd.DataFrame:
-    if os.path.exists(GEOCODE_CACHE_PATH):
+    if os.path.exists(GEOCODE_CACHE):
         try:
-            return pd.read_parquet(GEOCODE_CACHE_PATH)
+            return pd.read_parquet(GEOCODE_CACHE)
         except Exception:
-            try:
-                return pd.read_csv(GEOCODE_CACHE_PATH.replace(".parquet", ".csv"))
-            except Exception:
-                return pd.DataFrame(columns=["q","lat","lon"])
-    return pd.DataFrame(columns=["q","lat","lon"]) 
+            alt = GEOCODE_CACHE.replace(".parquet", ".csv")
+            if os.path.exists(alt):
+                return pd.read_csv(alt)
+    return pd.DataFrame(columns=["q","lat","lon"])
 
 
 def _save_geocode_cache(df: pd.DataFrame):
     try:
-        df.to_parquet(GEOCODE_CACHE_PATH, index=False)
+        df.to_parquet(GEOCODE_CACHE, index=False)
     except Exception:
-        df.to_csv(GEOCODE_CACHE_PATH.replace(".parquet", ".csv"), index=False)
+        df.to_csv(GEOCODE_CACHE.replace(".parquet", ".csv"), index=False)
 
 
 def nominatim_geocode(q: str) -> tuple[float|None, float|None]:
-    # キャッシュ
-    cache = st.session_state.get("_geocode_cache")
+    cache: pd.DataFrame = st.session_state.get("_geocode_cache")
     if cache is None:
         cache = _load_geocode_cache()
         st.session_state._geocode_cache = cache
     hit = cache[cache["q"] == q]
     if not hit.empty:
         row = hit.iloc[0]
-        return float(row["lat"]), float(row["lon"])
-    # 実問い合わせ
+        return float(row["lat"]) if pd.notna(row["lat"]) else None, float(row["lon"]) if pd.notna(row["lon"]) else None
     try:
         url = "https://nominatim.openstreetmap.org/search"
         params = {"q": q, "format": "json", "countrycodes": "jp", "limit": 1}
@@ -421,13 +421,11 @@ def nominatim_geocode(q: str) -> tuple[float|None, float|None]:
         r.raise_for_status()
         arr = r.json()
         if arr:
-            lat = float(arr[0]["lat"]); lon = float(arr[0]["lon"])
+            lat = float(arr[0]["lat"]); lon = float(arr[0]["lon"]) 
         else:
             lat = lon = None
     except Exception:
         lat = lon = None
-    # キャッシュ保存
-    cache = st.session_state._geocode_cache
     cache = pd.concat([cache, pd.DataFrame({"q":[q], "lat":[lat], "lon":[lon]})], ignore_index=True)
     st.session_state._geocode_cache = cache
     _save_geocode_cache(cache)
@@ -437,41 +435,31 @@ def nominatim_geocode(q: str) -> tuple[float|None, float|None]:
 def geocode_df(df: pd.DataFrame, addr_col: str, muni_col: str|None = None, max_rows: int = 1000) -> pd.DataFrame:
     out = df.copy()
     out["lat"] = np.nan; out["lon"] = np.nan
-    # クエリ生成（市町村+住所）
     queries = []
     for _, r in out.iterrows():
         a = str(r.get(addr_col) or "").strip()
         m = str(r.get(muni_col) or "").strip() if muni_col else ""
-        if a and m:
-            q = f"愛媛県 {m} {a}"
-        elif a:
-            q = f"愛媛県 {a}"
-        elif m:
-            q = f"愛媛県 {m}"
-        else:
-            q = ""
+        if a and m: q = f"愛媛県 {m} {a}"
+        elif a: q = f"愛媛県 {a}"
+        elif m: q = f"愛媛県 {m}"
+        else: q = ""
         queries.append(q)
-    # 実行
     pbar = st.progress(0, text="ジオコーディング中…")
     total = min(max_rows, len(out))
     for i in range(total):
         q = queries[i]
-        if not q:
-            continue
-        lat, lon = nominatim_geocode(q)
-        if lat is not None and lon is not None:
-            out.at[i, "lat"] = lat; out.at[i, "lon"] = lon
-        p = int((i+1)/total*100)
-        pbar.progress(p, text=f"{i+1}/{total} 件 処理…")
-        time.sleep(1.0)  # Nominatim礼儀
+        if q:
+            lat, lon = nominatim_geocode(q)
+            if lat is not None and lon is not None:
+                out.at[i, "lat"] = lat; out.at[i, "lon"] = lon
+        pbar.progress(int((i+1)/total*100), text=f"{i+1}/{total} 件 処理…")
+        time.sleep(1.0)  # レートリミット遵守
     pbar.empty()
     return out
 
-# ------------ Overpass（リスクPOI） ------------
-
+# ---------------- Overpass（POI） ----------------
 @st.cache_data(show_spinner=False, ttl=60*30)
 def query_overpass_poi(lat: float, lon: float, radius_m: int = 1200) -> pd.DataFrame:
-    # bicycle_parking, convenience, station, parking, pachinko, bar, nightlife, atm
     query = f"""
     [out:json][timeout:25];
     (
@@ -505,7 +493,7 @@ def query_overpass_poi(lat: float, lon: float, radius_m: int = 1200) -> pd.DataF
         })
     return pd.DataFrame(rows)
 
-# ------------ Map helpers ------------
+# ---------------- Map helpers ----------------
 
 def _add_common_map_ui(m: folium.Map):
     folium.TileLayer("cartodbpositron", name="Light").add_to(m)
@@ -518,7 +506,7 @@ def _add_common_map_ui(m: folium.Map):
     MousePosition(position="bottomright", separator=" | ", prefix="座標",
                   lat_formatter="function(num){return L.Util.formatNum(num,6);}",
                   lng_formatter="function(num){return L.Util.formatNum(num,6);}"
-                  ).add_to(m)
+                 ).add_to(m)
     if HAS_LOCATE:
         try:
             LocateControl(auto_start=False, flyTo=True, keepCurrentZoomLevel=True).add_to(m)  # type: ignore
@@ -548,8 +536,8 @@ def _plot_past_crimes_approx(m: folium.Map, df: pd.DataFrame | None):
         if not latlon:
             continue
         lat0, lon0 = latlon
-        lat = lat0 + float(rng.normal(0, 0.0010))
-        lon = lon0 + float(rng.normal(0, 0.0012))
+        lat = lat0 + float(rng.normal(0, 0.0010))  # ~100m
+        lon = lon0 + float(rng.normal(0, 0.0012))  # ~120m
         ctype = str(r.get("ctype") or "不明")
         color, icon = CTYPE_STYLE.get(ctype, ("gray", "glyphicon-question-sign"))
         date_txt = "" if pd.isna(r.get("date")) else pd.to_datetime(r.get("date")).strftime("%Y-%m-%d")
@@ -562,45 +550,40 @@ def _plot_points(m: folium.Map, df: pd.DataFrame, name: str, color: str, icon: s
         return
     cluster = MarkerCluster(name=name).add_to(m)
     for _, r in df.dropna(subset=["lat","lon"]).iterrows():
-        nm = str(r.get("name") or r.get("ctype") or "地点")
+        nm = str(r.get("name") or r.get("ctype") or r.get("address") or "地点")
         html = folium.Popup(nm, max_width=250)
         folium.Marker([float(r["lat"]), float(r["lon"])], popup=html, icon=folium.Icon(color=color, icon=icon)).add_to(cluster)
 
 
 def render_map(lat: float, lon: float, snap: dict | None, approx_df: pd.DataFrame | None, geocoded_df: pd.DataFrame | None, poi_df: pd.DataFrame | None):
-    m = folium.Map(location=[EHIME_CENTER_LAT, EHIME_CENTER_LON], zoom_start=9, tiles="cartodbpositron")
+    m = folium.Map(location=EHIME_CENTER, zoom_start=9, tiles="cartodbpositron")
     _add_common_map_ui(m)
-    _plot_past_crimes_approx(m, approx_df)
+    _plot_past_crimes_approx(m, approx_df)              # 2019概位置（維持）
     if geocoded_df is not None and not geocoded_df.empty:
         _plot_points(m, geocoded_df, "住所ジオコーディング結果", "blue", "ok-sign")
     if poi_df is not None and not poi_df.empty:
-        _plot_points(m, poi_df.rename(columns={"name":"name"}), "リスク指標POI", "purple", "record")
+        _plot_points(m, poi_df, "リスク指標POI", "purple", "record")
 
     popup_html = "<div style='color:#111;'>地点をクリックして選択</div>"
     if snap:
         radius = 1500 if snap["score"] < 50 else (2500 if snap["score"] < 75 else 3500)
         folium.Circle([lat, lon], radius=radius, color=snap["color"], fill=True, fill_opacity=0.25, weight=2).add_to(m)
         popup_html = f"""
-        <div style=\"color:#111;\">
-          <b>警戒度:</b> {snap['score']} ({snap['level']})<br/>
-          <b>月齢:</b> {snap.get('moon_age')}（{snap.get('moon_phase')}）<br/>
-          <b>天候:</b> {snap['condition']} / {snap['temp_c']}℃ / 降水{snap['precip_mm']}mm
-        </div>
+        <div style=\"color:#111;\"><b>警戒度:</b> {snap['score']} ({snap['level']})<br/>
+        <b>月齢:</b> {snap.get('moon_age')}（{snap.get('moon_phase')}）<br/>
+        <b>天候:</b> {snap['condition']} / {snap['temp_c']}℃ / 降水{snap['precip_mm']}mm</div>
         """
     folium.Marker([lat, lon], popup=folium.Popup(popup_html, max_width=320), draggable=True,
                   icon=folium.Icon(color="red" if snap and snap["score"]>=75 else ("orange" if snap and snap["score"]>=50 else "blue"), icon="info-sign")).add_to(m)
     return m
 
-# ------------ 将来最大リスク日の予測 ------------
+# ---------------- 将来最大リスク日 ----------------
 
 def projected_score_for_day(lat: float, lon: float, base_df: pd.DataFrame | None, d: datetime) -> float:
-    # 21:00 固定で評価（夜間係数が乗る時間帯）
-    dt = datetime(d.year, d.month, d.day, 21, 0, tzinfo=JST)
+    dt = datetime(d.year, d.month, d.day, 21, 0, tzinfo=JST)  # 夜間係数が乗る時間
     moon = get_mgpn_moon(lat, lon, dt) or {}
-    # 天気は不明 → 中立的な仮定
-    weather = {"temp_c": 26.0, "humidity": 65, "precip_mm": 0.0, "condition": "—"}
+    weather = {"temp_c": 26.0, "humidity": 65, "precip_mm": 0.0, "condition": "—"}  # 中立仮定
     snap = compute_risk_score(weather, dt, base_df, moon)
-    # 同点なら「満月に近いほど」優先されるように微調整
     bonus = 2.0 if is_full_moon_like_text(snap.get("moon_phase"), snap.get("moon_age")) else 0.0
     return float(snap["score"]) + bonus
 
@@ -615,7 +598,7 @@ def find_peak_day_next_30(lat: float, lon: float, base_df: pd.DataFrame | None, 
         time.sleep(0.05)  # API連打緩和
     return best_d, best_s
 
-# ------------ Gemini（任意） ------------
+# ---------------- Gemini（任意） ----------------
 
 def gemini_explain(snap: dict, now_dt: datetime) -> str | None:
     if not GEMINI_KEY:
@@ -636,51 +619,56 @@ def gemini_explain(snap: dict, now_dt: datetime) -> str | None:
     except Exception:
         return None
 
-# ------------ Main ------------
+# ---------------- Main ----------------
 
 def main():
     st.set_page_config(APP_TITLE, page_icon="🚨", layout="wide")
     st.markdown(DRAMA_CSS, unsafe_allow_html=True)
     st.markdown(f"<h1 class='page-title'>{APP_TITLE}</h1>", unsafe_allow_html=True)
-    st.caption("愛媛県全域。地図クリックで地点選択 → 『分析する』。月齢は mgpn v2 JSONを優先利用（v3フォールバック）。CSV住所はジオコーディングして地図に実点表示。POIもNETから補助表示。")
+    st.caption("愛媛県全域。地図クリックで地点選択 → 『分析する』。月齢は mgpn v2(JSON)優先（v3フォールバック）。2019年データの概位置は維持、住所CSVは座標化して実点表示。POIもNETから補助表示。")
 
     # --- State ---
     if "sel_lat" not in st.session_state: st.session_state.sel_lat = INIT_LAT
     if "sel_lon" not in st.session_state: st.session_state.sel_lon = INIT_LON
     if "last_snap" not in st.session_state: st.session_state.last_snap = None
+    if "geocoded_df" not in st.session_state: st.session_state.geocoded_df = None
+    if "poi_df" not in st.session_state: st.session_state.poi_df = None
 
     # --- Sidebar ---
     with st.sidebar:
         st.markdown("### 操作")
-        st.session_state.sel_lat = st.number_input("選択緯度", value=float(st.session_state.sel_lat), format="%.6f")
-        st.session_state.sel_lon = st.number_input("選択経度", value=float(st.session_state.sel_lon), format="%.6f")
-        analyze = st.button("🔎 分析する", use_container_width=True)
-        reset = st.button("📍 初期地点へ", use_container_width=True)
+        st.session_state.sel_lat = st.number_input("選択緯度", value=float(st.session_state.sel_lat), format="%.6f", key="lat_input")
+        st.session_state.sel_lon = st.number_input("選択経度", value=float(st.session_state.sel_lon), format="%.6f", key="lon_input")
+        analyze = st.button("🔎 分析する", use_container_width=True, key="btn_analyze")
+        reset = st.button("📍 初期地点へ", use_container_width=True, key="btn_reset")
         st.divider()
+
         st.markdown("### CSVアップロード（住所→座標）")
-        up = st.file_uploader("住所列を含むCSVを指定", type=["csv"], accept_multiple_files=False)
-        addr_col_name = st.text_input("住所列名（例: 住所 / 所在地）", value="住所")
-        muni_col_name = st.text_input("市町村列名（任意: 市町村名 等）", value="")
-        do_geocode = st.button("📌 ジオコーディング実行", use_container_width=True)
+        up = st.file_uploader("住所列を含むCSVを指定", type=["csv"], accept_multiple_files=False, key="uploader")
+        addr_col_name = st.text_input("住所列名（例: 住所 / 所在地）", value="住所", key="addr_col")
+        muni_col_name = st.text_input("市町村列名（任意: 市町村名 等）", value="", key="muni_col")
+        do_geocode = st.button("📌 ジオコーディング実行", use_container_width=True, key="btn_geocode")
         st.caption("※ Nominatim を1秒/件で丁寧に呼びます。結果は /mnt/data にキャッシュ。")
         st.divider()
-        st.markdown("### APIキー状態")
+
+        st.markdown("### POI（NET）")
+        poi_radius = st.slider("POI探索半径(m)", min_value=400, max_value=3000, value=1200, step=100, key="poi_radius")
+        fetch_poi = st.button("📍 近傍POIを取得", use_container_width=True, key="btn_poi")
+        st.divider()
+
+        st.markdown("### APIキー状態 / バージョン")
         st.write(f"- WeatherAPI: {'✅' if WEATHERAPI_KEY else '—'}")
         st.write(f"- OpenWeather: {'✅' if OPENWEATHER_KEY else '—'}")
         st.write("- mgpn: 公開API（キー不要）")
-        st.divider()
-        st.markdown("### POI（NET）")
-        poi_radius = st.slider("POI探索半径(m)", min_value=400, max_value=3000, value=1200, step=100)
-        fetch_poi = st.button("📍 近傍POIを取得", use_container_width=True)
+        st.write({"streamlit_folium": getattr(stf, "__version__", "?"), "folium": getattr(folium, "__version__", "?")})
 
-    # --- Load base 2019 data ---
+    # --- Load base 2019 data (維持) ---
     @st.cache_data(show_spinner=False)
     def _load_2019():
         return load_all_crime_2019(DATA_GLOBS)
     base_df = _load_2019()
 
     # --- Geocode uploaded CSV ---
-    geocoded_df = None
     if up is not None and do_geocode:
         try:
             raw = up.read()
@@ -695,22 +683,26 @@ def main():
         else:
             with st.spinner("住所を座標へ変換中…"):
                 geocoded_df = geocode_df(df_up, addr_col or muni_col, muni_col if addr_col else None, max_rows=min(1000, len(df_up)))
-                st.success(f"ジオコーディング完了: {geocoded_df.dropna(subset=['lat','lon']).shape[0]} / {len(geocoded_df)} 件に座標付与")
+            st.session_state.geocoded_df = geocoded_df
+            st.success(f"ジオコーディング完了: {geocoded_df.dropna(subset=['lat','lon']).shape[0]} / {len(geocoded_df)} 件に座標付与")
 
     # --- POI fetch ---
-    poi_df = None
     if fetch_poi:
         with st.spinner("Overpassから近傍POIを取得中…"):
             poi_df = query_overpass_poi(st.session_state.sel_lat, st.session_state.sel_lon, radius_m=poi_radius)
-            if poi_df is not None and not poi_df.empty:
-                st.success(f"POI取得: {len(poi_df)} 件")
-            else:
-                st.info("該当POIが見つかりませんでした。半径を広げてお試しください。")
+        st.session_state.poi_df = poi_df
+        if poi_df is not None and not poi_df.empty:
+            st.success(f"POI取得: {len(poi_df)} 件")
+        else:
+            st.info("該当POIが見つかりませんでした。半径を広げてお試しください。")
+
+    geocoded_df = st.session_state.geocoded_df
+    poi_df = st.session_state.poi_df
 
     # --- Map ---
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     fmap = render_map(st.session_state.sel_lat, st.session_state.sel_lon, st.session_state.last_snap, base_df, geocoded_df, poi_df)
-    out = render_st_folium(fmap, key="map_select", height=580, need_click=True)
+    out = render_map_failsafe(fmap, key="map_main", height=600, need_click=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     if out and isinstance(out, dict) and out.get("last_clicked"):
@@ -730,12 +722,16 @@ def main():
 
     if analyze:
         overlay = st.empty()
-        overlay.markdown("""
+        overlay.markdown(
+            """
             <div class='overlay'><div class='overlay-content'>
               <div class='overlay-title'>解析中</div>
               <div class='overlay-sub'>気象・月齢（mgpn）・2019傾向を統合しています…</div>
               <div class='loader'></div>
-            </div></div>""", unsafe_allow_html=True)
+            </div></div>
+            """,
+            unsafe_allow_html=True,
+        )
         p = st.progress(0, text="準備中…")
         for i, txt in [(15, "気象の取得…"), (40, "月齢（mgpn）の取得…"), (70, "2019年傾向の補正…"), (100, "スコア集計…")]:
             time.sleep(0.35); p.progress(i, text=txt)
@@ -766,7 +762,8 @@ def main():
 
             st.markdown("<div class='card'>", unsafe_allow_html=True)
             st.markdown("**内部理由（ヒューリスティック + 2019補正 + 月齢）**")
-            for r in snap["reasons"]: st.write("・", r)
+            for r in snap["reasons"]:
+                st.write("・", r)
             st.markdown("</div>", unsafe_allow_html=True)
 
             if base_df is not None and not base_df.empty:
@@ -778,7 +775,7 @@ def main():
 
         with c2:
             st.markdown("<div class='card'>", unsafe_allow_html=True)
-            st.markdown("**将来30日の最大リスク予測（21:00時点評価）**")
+            st.markdown("**将来30日の最大リスク予測（21:00評価）**")
             with st.spinner("月齢を用いて30日予測を計算中…"):
                 best_day, best_score = find_peak_day_next_30(st.session_state.sel_lat, st.session_state.sel_lon, base_df, datetime.now(JST).replace(hour=0,minute=0,second=0,microsecond=0))
             if best_day:
@@ -788,7 +785,7 @@ def main():
             st.markdown("</div>", unsafe_allow_html=True)
 
     # --- Footer ---
-    st.caption("※ mgpnはv2(JSON)→v3の順で呼出し、30分キャッシュ。住所のジオコーディングはNominatim(1秒/件)で行い、/mnt/dataにキャッシュします。POIはOverpass APIから取得。将来予測は月齢と季節・曜日ヒューリスティックで概算です。")
+    st.caption("※ mgpnはv2(JSON)→v3の順で呼出し、30分キャッシュ。住所のジオコーディングはNominatim(1秒/件)で行い、/mnt/dataにキャッシュします。POIはOverpass APIから取得。将来予測は月齢と曜日・季節ヒューリスティックによる概算です。2019年犯罪データの概位置レイヤは維持しています。")
 
 
 if __name__ == "__main__":
