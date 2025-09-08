@@ -1,9 +1,12 @@
-streamlit
-pandas
-numpy
-request
-python-dateutil
-streamlit-folium
-folium
-chardet
-google-generativeai  # 任意（Gemini 2.5 Flash を使う場合）
+streamlit==1.37.1
+pandas==2.2.2
+numpy==1.26.4
+requests==2.32.3
+python-dateutil==2.9.0.post0
+streamlit-folium==0.21.0
+folium==0.16.0
+chardet==5.2.0
+google-generativeai==0.8.2
+protobuf>=4.25.3
+grpcio>=1.62.1
+typing-extensions>=4.12.2
