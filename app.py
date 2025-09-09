@@ -6,7 +6,8 @@
 # - 「分析する」ボタン → 進捗バー + 画面中央オーバーレイ「解析中」
 # - 気象（WeatherAPI/OpenWeather） + mgpn 月齢API（ver2/3） + 2019傾向補正
 # - mgpn はボタン押下時のみ呼出し・30分キャッシュ・ver1は使用しない
-# - Gemini 2.5 Flash（任意）で説明生成
+# - map: レイヤ切替・フルスクリーン・ミニマップ・測距などを追加（視認性UP）
+# - DuplicateWidgetID 回避：st_folium に一意 key を付与
 # ============================================================
 
 import os
@@ -21,6 +22,7 @@ import pandas as pd
 import streamlit as st
 from streamlit_folium import st_folium
 import folium
+from folium.plugins import MiniMap, MousePosition, MeasureControl, Fullscreen, LocateControl
 
 # ---------------------------
 # 基本設定
@@ -44,7 +46,6 @@ DATA_GLOBS = [
     "./data/ehime_2019*.csv",
     "/mnt/data/ehime_2019*.csv",
 ]
-MUNICIPALITY_DEFAULT = "愛媛県"
 
 # ---------------------------
 # UI スタイル（ドラマ風 + 中央オーバーレイ）
@@ -135,6 +136,7 @@ except Exception:
 # ---------------------------
 # CSV 読み込み（堅牢）
 # ---------------------------
+
 def read_csv_robust(path: str) -> pd.DataFrame:
     with open(path, "rb") as f:
         raw = f.read()
@@ -146,29 +148,32 @@ def read_csv_robust(path: str) -> pd.DataFrame:
             continue
     return pd.read_csv(path, encoding_errors="ignore")
 
+
 def guess_columns(df: pd.DataFrame) -> dict:
     cols_lower = {c: str(c).lower() for c in df.columns}
     # 発生日
     date_col = next((c for c in df.columns if re.search(r"(発生|年月日|日付|日時)", str(c))), None)
     if not date_col:
-        date_col = next((c for c in df.columns if any(k in cols_lower[c] for k in ["date","day","time","occur"])), None)
+        date_col = next((c for c in df.columns if any(k in cols_lower[c] for k in ["date", "day", "time", "occur"])), None)
     # 市町村
     muni_col = next((c for c in df.columns if re.search(r"(市|町|村).*名", str(c)) or re.search(r"(市町村|自治体|地域)", str(c))), None)
     if not muni_col:
-        muni_col = next((c for c in df.columns if any(k in cols_lower[c] for k in ["municipality","city","town","area","region"])), None)
+        muni_col = next((c for c in df.columns if any(k in cols_lower[c] for k in ["municipality", "city", "town", "area", "region"])), None)
     # 手口
     type_col = next((c for c in df.columns if re.search(r"(手口|罪|罪種|種別|分類)", str(c))), None)
     if not type_col:
-        type_col = next((c for c in df.columns if any(k in cols_lower[c] for k in ["type","category","kind","crime"])), None)
+        type_col = next((c for c in df.columns if any(k in cols_lower[c] for k in ["type", "category", "kind", "crime"])), None)
     return {"date": date_col, "municipality": muni_col, "ctype": type_col}
+
 
 def parse_date_series(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, errors="coerce")
 
-def load_all_crime_2019(data_globs: list[str] = None) -> pd.DataFrame | None:
+
+def load_all_crime_2019(data_globs: list[str] | None = None) -> pd.DataFrame | None:
     if data_globs is None:
         data_globs = DATA_GLOBS
-    files = []
+    files: list[str] = []
     for g in data_globs:
         files.extend(glob.glob(g))
     files = sorted(set(files))
@@ -203,19 +208,21 @@ def load_all_crime_2019(data_globs: list[str] = None) -> pd.DataFrame | None:
             ctype = None
             for k, v in mapping.items():
                 if k in base:
-                    ctype = v; break
+                    ctype = v
+                    break
             df["ctype"] = ctype if ctype else "不明"
         else:
             df.rename(columns={g["ctype"]: "ctype"}, inplace=True)
             df["ctype"] = df["ctype"].astype(str)
         # 2019のみ（念のため）
         df = df[(df["date"].dt.year == 2019) | (df["date"].isna())]
-        frames.append(df[["date","municipality","ctype"]])
+        frames.append(df[["date", "municipality", "ctype"]])
     return pd.concat(frames, ignore_index=True)
 
 # ---------------------------
 # 気象（任意API：キー無ければダミー）
 # ---------------------------
+
 def get_weather_weatherapi(lat, lon):
     try:
         if not WEATHERAPI_KEY:
@@ -236,13 +243,15 @@ def get_weather_weatherapi(lat, lon):
     except Exception:
         return None
 
+
 def get_weather_openweather(lat, lon):
     try:
         if not OPENWEATHER_KEY:
             return None
         url = "https://api.openweathermap.org/data/2.5/weather"
         p = {"lat": lat, "lon": lon, "appid": OPENWEATHER_KEY, "units": "metric", "lang": "ja"}
-        r = requests.get(url, params=p, timeout=10); r.raise_for_status()
+        r = requests.get(url, params=p, timeout=10)
+        r.raise_for_status()
         jd = r.json()
         return {
             "provider": "openweather",
@@ -255,48 +264,66 @@ def get_weather_openweather(lat, lon):
     except Exception:
         return None
 
+
 def get_weather(lat, lon):
     w = get_weather_weatherapi(lat, lon)
-    if not w: w = get_weather_openweather(lat, lon)
     if not w:
-        w = {"provider": "dummy", "temp_c": 26.0, "humidity": 70,
-             "condition": "晴れ", "precip_mm": 0.0, "wind_kph": 8.0}
+        w = get_weather_openweather(lat, lon)
+    if not w:
+        w = {"provider": "dummy", "temp_c": 26.0, "humidity": 70, "condition": "晴れ", "precip_mm": 0.0, "wind_kph": 8.0}
     return w
 
 # ---------------------------
 # mgpn 月齢API（ver2→ver3フォールバック）※30分キャッシュ
 # ---------------------------
+
 def _extract_moonage(payload) -> float | None:
-    if payload is None: return None
+    if payload is None:
+        return None
     obj = payload[0] if isinstance(payload, list) and payload else (payload if isinstance(payload, dict) else None)
-    if not obj: return None
+    if not obj:
+        return None
     for k in ["moonage", "moon_age", "moonAge", "age"]:
         if k in obj and obj[k] is not None:
-            try: return float(obj[k])
-            except Exception: pass
+            try:
+                return float(obj[k])
+            except Exception:
+                pass
     return None
 
+
 def _phase_text_from_age(age: float | None) -> str | None:
-    if age is None: return None
+    if age is None:
+        return None
     a = age % 29.53
-    if a < 1.0: return "新月"
-    if a < 6.0: return "三日月（若月）"
-    if a < 8.9: return "上弦前後"
-    if a < 13.5: return "十三夜～満月前"
-    if a < 16.0: return "満月前後"
-    if a < 21.0: return "満月後～下弦前"
-    if a < 23.5: return "下弦前後"
-    if a < 28.0: return "有明月（残月）"
+    if a < 1.0:
+        return "新月"
+    if a < 6.0:
+        return "三日月（若月）"
+    if a < 8.9:
+        return "上弦前後"
+    if a < 13.5:
+        return "十三夜～満月前"
+    if a < 16.0:
+        return "満月前後"
+    if a < 21.0:
+        return "満月後～下弦前"
+    if a < 23.5:
+        return "下弦前後"
+    if a < 28.0:
+        return "有明月（残月）"
     return "新月に近い"
 
-@st.cache_data(show_spinner=False, ttl=60*30)
+
+@st.cache_data(show_spinner=False, ttl=60 * 30)
 def get_mgpn_moon(lat: float, lon: float, dt_jst: datetime) -> dict | None:
     t = dt_jst.strftime("%Y-%m-%dT%H:%M")  # JST指定
     # ver2
     try:
         url = "https://mgpn.org/api/moon/v2position.cgi"
         params = {"time": t, "lat": f"{lat:.6f}", "lon": f"{lon:.6f}", "loop": 1, "interval": 0}
-        r = requests.get(url, params=params, timeout=8); r.raise_for_status()
+        r = requests.get(url, params=params, timeout=8)
+        r.raise_for_status()
         payload = r.json()
         age = _extract_moonage(payload)
         obj = payload[0] if isinstance(payload, list) and payload else payload
@@ -309,7 +336,8 @@ def get_mgpn_moon(lat: float, lon: float, dt_jst: datetime) -> dict | None:
     try:
         url = "https://mgpn.org/api/moon/v3position.cgi"
         params = {"time": t, "lat": f"{lat:.6f}", "lon": f"{lon:.6f}"}
-        r = requests.get(url, params=params, timeout=8); r.raise_for_status()
+        r = requests.get(url, params=params, timeout=8)
+        r.raise_for_status()
         payload = r.json()
         age = _extract_moonage(payload)
         obj = payload[0] if isinstance(payload, list) and payload else payload
@@ -319,8 +347,10 @@ def get_mgpn_moon(lat: float, lon: float, dt_jst: datetime) -> dict | None:
     except Exception:
         return None
 
+
 def is_full_moon_like_text(phase_text: str | None, age: float | None) -> bool:
-    if phase_text and ("満月" in phase_text): return True
+    if phase_text and ("満月" in phase_text):
+        return True
     if age is not None:
         a = age % 29.53
         return 13.3 <= a <= 16.3
@@ -329,10 +359,10 @@ def is_full_moon_like_text(phase_text: str | None, age: float | None) -> bool:
 # ---------------------------
 # スコア計算（愛媛全域／2019傾向＋月齢）
 # ---------------------------
-def compute_risk_score(weather: dict, now_dt: datetime, all_df: pd.DataFrame | None,
-                       moon_info: dict | None) -> dict:
+
+def compute_risk_score(weather: dict, now_dt: datetime, all_df: pd.DataFrame | None, moon_info: dict | None) -> dict:
     score = 0.0
-    reasons = []
+    reasons: list[str] = []
 
     temp = float(weather.get("temp_c", 20.0))
     precip = float(weather.get("precip_mm", 0.0))
@@ -340,58 +370,91 @@ def compute_risk_score(weather: dict, now_dt: datetime, all_df: pd.DataFrame | N
     cond = str(weather.get("condition", ""))
 
     # 気温
-    if temp >= 32: add = 42
-    elif temp >= 30: add = 36
-    elif temp >= 27: add = 28
-    elif temp >= 25: add = 20
-    elif temp >= 22: add = 10
-    else: add = 0
+    if temp >= 32:
+        add = 42
+    elif temp >= 30:
+        add = 36
+    elif temp >= 27:
+        add = 28
+    elif temp >= 25:
+        add = 20
+    elif temp >= 22:
+        add = 10
+    else:
+        add = 0
     score += add
-    if add > 0: reasons.append(f"気温{temp:.0f}℃:+{add}")
+    if add > 0:
+        reasons.append(f"気温{temp:.0f}℃:+{add}")
 
     # 降雨
-    if precip >= 10: score -= 20; reasons.append("強い降雨:-20")
-    elif precip >= 1: score -= 8; reasons.append("降雨あり:-8")
+    if precip >= 10:
+        score -= 20
+        reasons.append("強い降雨:-20")
+    elif precip >= 1:
+        score -= 8
+        reasons.append("降雨あり:-8")
 
     # 時間帯
     hour = now_dt.hour
     if 20 <= hour <= 23 or 0 <= hour <= 4:
-        score += 15; reasons.append("夜間:+15")
+        score += 15
+        reasons.append("夜間:+15")
     elif 17 <= hour < 20:
-        score += 7; reasons.append("夕方:+7")
+        score += 7
+        reasons.append("夕方:+7")
 
     # 週末
     if now_dt.weekday() in (4, 5):
-        score += 6; reasons.append("週末(+金土):+6")
+        score += 6
+        reasons.append("週末(+金土):+6")
 
     # 月齢（mgpn）
     moon_age = moon_info.get("moon_age") if moon_info else None
     moon_phase_text = moon_info.get("phase_text") if moon_info else None
     if is_full_moon_like_text(moon_phase_text, moon_age):
-        score += 5; reasons.append("満月相当:+5")
+        score += 5
+        reasons.append("満月相当:+5")
 
     # 湿度
     if humidity >= 80:
-        score += 3; reasons.append("高湿度:+3")
+        score += 3
+        reasons.append("高湿度:+3")
 
     # 2019傾向（県全域）
     if all_df is not None and not all_df.empty:
         sub = all_df.copy()
         sub["month"] = sub["date"].dt.month
         month_ratio = len(sub[sub["month"] == now_dt.month]) / max(1, len(sub))
-        if month_ratio >= 0.12: score += 6; reasons.append("2019傾向(同月比 多め):+6")
-        elif month_ratio >= 0.08: score += 3; reasons.append("2019傾向(同月比 やや多め):+3")
+        if month_ratio >= 0.12:
+            score += 6
+            reasons.append("2019傾向(同月比 多め):+6")
+        elif month_ratio >= 0.08:
+            score += 3
+            reasons.append("2019傾向(同月比 やや多め):+3")
         if "ctype" in sub.columns:
             top_types = sub["ctype"].value_counts(normalize=True)
-            outdoor_like = float(top_types.get("ひったくり",0)+top_types.get("車上ねらい",0)+top_types.get("自転車盗",0)+top_types.get("オートバイ盗",0))
-            if outdoor_like >= 0.45: score += 5; reasons.append("2019傾向(屋外系多):+5")
-            elif outdoor_like >= 0.30: score += 2; reasons.append("2019傾向(屋外系やや多):+2")
+            outdoor_like = float(
+                top_types.get("ひったくり", 0)
+                + top_types.get("車上ねらい", 0)
+                + top_types.get("自転車盗", 0)
+                + top_types.get("オートバイ盗", 0)
+            )
+            if outdoor_like >= 0.45:
+                score += 5
+                reasons.append("2019傾向(屋外系多):+5")
+            elif outdoor_like >= 0.30:
+                score += 2
+                reasons.append("2019傾向(屋外系やや多):+2")
 
     score = float(np.clip(score, 0, 100))
-    if score < 25: level, color = "Low", "#0aa0ff"
-    elif score < 50: level, color = "Moderate", "#ffd033"
-    elif score < 75: level, color = "High", "#ff7f2a"
-    else: level, color = "Very High", "#ff2a2a"
+    if score < 25:
+        level, color = "Low", "#0aa0ff"
+    elif score < 50:
+        level, color = "Moderate", "#ffd033"
+    elif score < 75:
+        level, color = "High", "#ff7f2a"
+    else:
+        level, color = "Very High", "#ff2a2a"
 
     return {
         "score": round(score, 1),
@@ -409,6 +472,7 @@ def compute_risk_score(weather: dict, now_dt: datetime, all_df: pd.DataFrame | N
 # ---------------------------
 # Gemini 説明（任意）
 # ---------------------------
+
 def gemini_explain(snap: dict, now_dt: datetime) -> str | None:
     if not GEMINI_KEY:
         return None
@@ -423,7 +487,7 @@ def gemini_explain(snap: dict, now_dt: datetime) -> str | None:
                 "根拠を、過度な断定を避けて簡潔に日本語で説明してください。"
                 "満月効果は限定的、気温・時間帯・降雨などの影響は統計的示唆あり、を前提に、"
                 "最後に取るべき具体的行動（人通りの少ない場所を避ける等）で締めること。"
-            )
+            ),
         )
         prompt = (
             f"現在: {now_dt.strftime('%Y-%m-%d %H:%M JST')}\n"
@@ -440,45 +504,84 @@ def gemini_explain(snap: dict, now_dt: datetime) -> str | None:
 
 # ---------------------------
 # マップ描画（Folium）＋クリック選択
+#  - 見やすさ強化：複数タイル + レイヤコントロール + フルスクリーン + ミニマップ + 測距 + 位置情報
 # ---------------------------
+
+def _add_common_map_ui(m: folium.Map):
+    # 追加タイル（昼/淡色/衛星）
+    folium.TileLayer("cartodbpositron", name="Light").add_to(m)
+    folium.TileLayer("cartodbdark_matter", name="Dark").add_to(m)
+    folium.TileLayer("OpenStreetMap", name="OSM").add_to(m)
+    folium.TileLayer(
+        tiles="https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png",
+        attr="OSM HOT",
+        name="OSM HOT",
+        control=True,
+    ).add_to(m)
+    # プラグイン
+    Fullscreen(position="topleft").add_to(m)
+    MiniMap(zoom_level_fixed=5, toggle_display=True).add_to(m)
+    MeasureControl(position="topleft", primary_length_unit="meters").add_to(m)
+    MousePosition(
+        position="bottomright",
+        separator=" | ",
+        prefix="座標",
+        lat_formatter="function(num) {return L.Util.formatNum(num, 6);}",
+        lng_formatter="function(num) {return L.Util.formatNum(num, 6);}"
+    ).add_to(m)
+    try:
+        LocateControl(auto_start=False, flyTo=True, keepCurrentZoomLevel=True).add_to(m)
+    except Exception:
+        pass
+    folium.LayerControl(collapsed=True).add_to(m)
+
+
 def render_map_selectable(lat: float, lon: float, snap: dict | None):
-    m = folium.Map(location=[EHIME_CENTER_LAT, EHIME_CENTER_LON],
-                   zoom_start=9, tiles="cartodb dark_matter")
-    popup_html = "<div style='color:#fff;'>地点をクリックして選択</div>"
+    # 見やすいライト基調をデフォルト（positron）
+    m = folium.Map(location=[EHIME_CENTER_LAT, EHIME_CENTER_LON], zoom_start=9, tiles="cartodbpositron")
+    _add_common_map_ui(m)
+
+    popup_html = "<div style='color:#111;'>地点をクリックして選択</div>"
     if snap:
         radius = 1500 if snap["score"] < 50 else (2500 if snap["score"] < 75 else 3500)
-        folium.Circle(location=[lat, lon], radius=radius,
-                      color=snap["color"], fill=True, fill_opacity=0.25, weight=2).add_to(m)
+        folium.Circle(
+            location=[lat, lon], radius=radius, color=snap["color"], fill=True, fill_opacity=0.25, weight=2
+        ).add_to(m)
         popup_html = f"""
-        <div style="color:#fff;">
+        <div style="color:#111;">
           <b>警戒度:</b> {snap['score']} ({snap['level']})<br/>
           <b>月齢:</b> {snap.get('moon_age')}（{snap.get('moon_phase')}）<br/>
           <b>天候:</b> {snap['condition']} / {snap['temp_c']}℃ / 降水{snap['precip_mm']}mm
         </div>
         """
+
     folium.Marker(
         [lat, lon],
-        popup=folium.Popup(popup_html, max_width=280),
+        popup=folium.Popup(popup_html, max_width=320),
         draggable=True,
-        icon=folium.Icon(color="lightgray" if not snap else ("red" if snap["score"]>=75 else "orange" if snap["score"]>=50 else "blue"),
-                         icon="info-sign")
+        icon=folium.Icon(color="lightgray" if not snap else ("red" if snap["score"] >= 75 else "orange" if snap["score"] >= 50 else "blue"), icon="info-sign"),
     ).add_to(m)
+
     return m
 
 # ---------------------------
 # Streamlit 本体
 # ---------------------------
+
 def main():
     st.set_page_config(APP_TITLE, page_icon="🚨", layout="wide")
     st.markdown(DRAMA_CSS, unsafe_allow_html=True)
 
     st.markdown(f"<h1 style='margin:0 0 8px 0;'>{APP_TITLE}</h1>", unsafe_allow_html=True)
-    st.caption("愛媛県全域。地図クリックで地点選択 → 「分析する」でスコア算出。月齢は mgpn API（ver2/3）を安全に利用。")
+    st.caption("愛媛県全域。地図クリックで地点選択 → 『分析する』でスコア算出。月齢は mgpn API（ver2/3）を安全に利用。")
 
     # セッションステート
-    if "sel_lat" not in st.session_state: st.session_state.sel_lat = INIT_LAT
-    if "sel_lon" not in st.session_state: st.session_state.sel_lon = INIT_LON
-    if "last_snap" not in st.session_state: st.session_state.last_snap = None
+    if "sel_lat" not in st.session_state:
+        st.session_state.sel_lat = INIT_LAT
+    if "sel_lon" not in st.session_state:
+        st.session_state.sel_lon = INIT_LON
+    if "last_snap" not in st.session_state:
+        st.session_state.last_snap = None
 
     # サイドバー
     with st.sidebar:
@@ -500,7 +603,8 @@ def main():
         else:
             st.warning("データが見つかりませんでした: " + ", ".join(DATA_GLOBS))
         if st.button("🔄 データ再スキャン/キャッシュ削除"):
-            st.cache_data.clear(); st.experimental_rerun()
+            st.cache_data.clear()
+            st.experimental_rerun()
 
         st.divider()
         st.markdown("#### API キー状態")
@@ -513,37 +617,43 @@ def main():
     @st.cache_data(show_spinner=False)
     def _load_2019():
         return load_all_crime_2019(DATA_GLOBS)
+
     all_df = _load_2019()
 
     # 地図（クリックで地点更新）
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.markdown("**地図：クリックで任意地点を選択（ドラッグで微調整）**")
     fmap = render_map_selectable(st.session_state.sel_lat, st.session_state.sel_lon, st.session_state.last_snap)
-    out = st_folium(fmap, height=520, returned_objects=["last_clicked"])
+    out = st_folium(fmap, height=540, returned_objects=["last_clicked"], key="map_select")
     st.markdown("</div>", unsafe_allow_html=True)
+
     if out and out.get("last_clicked"):
-        lat = out["last_clicked"]["lat"]; lon = out["last_clicked"]["lng"]
+        lat = out["last_clicked"]["lat"]
+        lon = out["last_clicked"]["lng"]
         if (EHIME_BBOX["min_lat"] <= lat <= EHIME_BBOX["max_lat"]) and (EHIME_BBOX["min_lon"] <= lon <= EHIME_BBOX["max_lon"]):
-            st.session_state.sel_lat = float(lat); st.session_state.sel_lon = float(lon)
+            st.session_state.sel_lat = float(lat)
+            st.session_state.sel_lon = float(lon)
         else:
             st.warning("選択地点が愛媛県の想定範囲外です。")
 
     # 操作ボタン
-    colb1, colb2, colb3 = st.columns([1,1,2])
+    colb1, colb2, _ = st.columns([1, 1, 2])
     with colb1:
         analyze = st.button("🔎 分析する", use_container_width=True)
     with colb2:
         reset = st.button("📍 初期地点へ戻す", use_container_width=True)
 
     if reset:
-        st.session_state.sel_lat = INIT_LAT; st.session_state.sel_lon = INIT_LON
+        st.session_state.sel_lat = INIT_LAT
+        st.session_state.sel_lon = INIT_LON
         st.session_state.last_snap = None
         st.experimental_rerun()
 
     # 分析フロー（ボタン押下時のみ API 呼出し）
     if analyze:
         overlay = st.empty()
-        overlay.markdown("""
+        overlay.markdown(
+            """
             <div class="overlay">
               <div class="overlay-content">
                 <div class="overlay-title">解析中</div>
@@ -551,11 +661,13 @@ def main():
                 <div class="loader"></div>
               </div>
             </div>
-        """, unsafe_allow_html=True)
+        """,
+            unsafe_allow_html=True,
+        )
         p = st.progress(0, text="準備中…")
-        for i, txt in [(15,"気象の取得…"), (40,"月齢（mgpn）の取得…"),
-                       (70,"2019年傾向の補正…"), (100,"スコア集計…")]:
-            time.sleep(0.35); p.progress(i, text=txt)
+        for i, txt in [(15, "気象の取得…"), (40, "月齢（mgpn）の取得…"), (70, "2019年傾向の補正…"), (100, "スコア集計…")]:
+            time.sleep(0.35)
+            p.progress(i, text=txt)
 
         now_dt = datetime.now(JST)
         lat, lon = st.session_state.sel_lat, st.session_state.sel_lon
@@ -564,17 +676,24 @@ def main():
         snap = compute_risk_score(weather, now_dt, all_df, moon_info)
         st.session_state.last_snap = snap
 
-        overlay.empty(); p.empty()
+        overlay.empty()
+        p.empty()
 
     # 結果表示
     snap = st.session_state.last_snap
     if snap:
         if snap["score"] >= 75:
-            st.markdown(f"<div class='alert-bar'>警報：現在の警戒レベル <b>{snap['level']}</b>（{snap['score']}）。周囲に注意。</div>", unsafe_allow_html=True)
+            st.markdown(
+                f"<div class='alert-bar'>警報：現在の警戒レベル <b>{snap['level']}</b>（{snap['score']}）。周囲に注意。</div>",
+                unsafe_allow_html=True,
+            )
         elif snap["score"] >= 50:
-            st.markdown(f"<div class='alert-bar' style='background:linear-gradient(90deg, rgba(200,120,0,0.85), rgba(255,170,0,0.85));'>注意：現在の警戒レベル <b>{snap['level']}</b>（{snap['score']}）。</div>", unsafe_allow_html=True)
+            st.markdown(
+                f"<div class='alert-bar' style='background:linear-gradient(90deg, rgba(200,120,0,0.85), rgba(255,170,0,0.85));'>注意：現在の警戒レベル <b>{snap['level']}</b>（{snap['score']}）。</div>",
+                unsafe_allow_html=True,
+            )
 
-        c1, c2 = st.columns([1,1])
+        c1, c2 = st.columns([1, 1])
         with c1:
             st.markdown("<div class='card'>", unsafe_allow_html=True)
             st.markdown("<div class='mute'>CURRENT RISK</div>", unsafe_allow_html=True)
@@ -585,7 +704,7 @@ def main():
                 f"**月齢**：{snap.get('moon_age')}（{snap.get('moon_phase')}） / "
                 f"**天候**：{snap['condition']} / **気温**：{snap['temp_c']}℃ / "
                 f"**降水**：{snap['precip_mm']}mm / **湿度**：{snap['humidity']}%",
-                unsafe_allow_html=True
+                unsafe_allow_html=True,
             )
             st.markdown("</div>", unsafe_allow_html=True)
 
@@ -606,7 +725,8 @@ def main():
             st.markdown("<div class='card'>", unsafe_allow_html=True)
             st.markdown("**警戒ゾーン（選択地点に対する可視化）**")
             fmap2 = render_map_selectable(st.session_state.sel_lat, st.session_state.sel_lon, snap)
-            st_folium(fmap2, height=420, returned_objects=[])
+            # DuplicateWidgetID 回避：別 key を使用
+            st_folium(fmap2, height=460, returned_objects=[], key="map_result")
             st.markdown("</div>", unsafe_allow_html=True)
 
             if run_gemini:
@@ -620,8 +740,9 @@ def main():
     # フッター（注意書き）
     st.caption(
         "※ 月齢は mgpn API（ver2/3）をボタン押下時にのみ呼出し、30分キャッシュして負荷を抑制しています。"
-        " 気象APIキーが無い場合はダミー値で動作します。2019年オープンデータは./, ./data, /mnt/dataの順に自動検出します。"
+        " 気象APIキーが無い場合はダミー値で動作します。2019年オープンデータは ./, ./data, /mnt/data の順に自動検出します。"
     )
+
 
 if __name__ == "__main__":
     main()
