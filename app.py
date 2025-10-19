@@ -2,7 +2,6 @@
 # ============================================================
 # 愛媛セーフティ・プラットフォーム / Ehime Safety Platform
 # SIBYL拡張（犯罪係数モード）+ 既存機能（気象・月齢・2019統計・POI・CSVジオコーディング）
-#  ベース実装を参考に拡張  :contentReference[oaicite:1]{index=1}
 # ============================================================
 
 import os, re, io, glob, json, time, math, random, inspect, traceback
@@ -49,7 +48,7 @@ CITY_NAMES = [
 ]
 
 # ---------------------------
-# スタイル（SIBYL風を上乗せ）
+# スタイル（SIBYL風）
 # ---------------------------
 DRAMA_CSS = """
 <style>
@@ -319,49 +318,34 @@ def compute_risk_score(weather: dict, now_dt: datetime, all_df: pd.DataFrame | N
 # ---------------------------
 @st.cache_data(show_spinner=False, ttl=10*60)
 def fetch_police_muni_counts() -> dict:
-    """
-    速報ページの本文テキストから、市町名の出現数をカウント。
-    （注意）本文は“最近の出来事”の羅列で、厳密な発生件数ではないため、
-            UIでは「最近の通報/記載頻度の指標」として用いる（過大解釈しない）。
-    """
     try:
         r = requests.get(EHIME_POLICE_URL, headers={"User-Agent": USER_AGENT}, timeout=12)
         r.raise_for_status()
         r.encoding = r.apparent_encoding or r.encoding or "utf-8"
         text = re.sub(r"\s+", " ", r.text)
-        # HTMLタグを粗消し
         text = re.sub(r"<[^>]+>", " ", text)
     except Exception:
         return {}
 
     counts = {c: 0 for c in CITY_NAMES}
-    # 見出し＋本文の両方を対象
     for c in CITY_NAMES:
-        # “松山市内”“松山市のA女さん”など多様なので部分一致
         counts[c] = len(re.findall(re.escape(c), text))
 
-    # ノイズ削減（極端な外れ値はしきい+ロバスト処理）
     mx = max(counts.values()) if counts else 0
     if mx > 0:
         for k,v in counts.items():
-            counts[k] = int(min(v, max(1, mx)))  # 天井を最大値にクリップ
+            counts[k] = int(min(v, max(1, mx)))
     return counts
 
 # ---------------------------
 # CC（Crime Coefficient 0–300）
 # ---------------------------
 def compute_cc_from_risk_and_news(risk_score_0_100: float, recent_count: int) -> int:
-    """
-    CC = round( risk*2.4 + 30*min(recent_count,5) ), clipped 0..300
-    - risk: 本アプリ内の“現在リスク”（気象・時間帯・週末・月齢・2019傾向）
-    - recent_count: 県警速報ページでの当該市町名の最新出現回数（≒最近の通報/記載頻度の指標）
-    ※ データの性質上、CCは「注意喚起のための相対指標」。断定的な解釈は行わない。
-    """
     cc = int(round(risk_score_0_100 * 2.4 + 30 * min(int(recent_count), 5)))
     return int(clamp(cc, 0, 300))
 
 # ---------------------------
-# st_folium 互換ラッパ（失敗時HTML直埋め）
+# st_folium 互換ラッパ
 # ---------------------------
 def call_st_folium_with_fallback(m: folium.Map, height: int, key: str, return_last_clicked: bool = False):
     args = inspect.signature(st_folium).parameters
@@ -494,41 +478,28 @@ def add_2019_layer(m: folium.Map, all_df: pd.DataFrame | None, max_points: int =
 # SIBYL：犯罪係数レイヤ
 # ---------------------------
 def add_sybil_cc_layer(m: folium.Map, muni_counts: dict, base_dt: datetime, all_df: pd.DataFrame):
-    """
-    各市町の重心で現在のリスクスコアを評価し、県警速報の出現回数を加味して
-    CC(0–300)を算出。色と半径で可視化。
-    """
     if not muni_counts: return
     fg = folium.FeatureGroup(name="犯罪係数（SIBYL）")
-    ranks = []  # for sidebar/top-5
-
+    ranks = []
     for muni in CITY_NAMES:
-        # 市町重心
         lat0, lon0 = geocode_municipality(muni)
         if not lat0 or not lon0: continue
-
         weather = get_weather(lat0, lon0)
         moon = get_mgpn_moon(lat0, lon0, base_dt)
         risk = compute_risk_score(weather, base_dt, all_df, moon)["score"]
         recent = int(muni_counts.get(muni, 0))
         cc = compute_cc_from_risk_and_news(risk, recent)
-
-        # カラーグラデーション（0→青 / 150→橙 / 250→赤 / 300→濃赤）
         if   cc >= 250: color = "#ff1a1a"
         elif cc >= 150: color = "#ff9f2a"
         elif cc >= 100: color = "#ffd033"
         else:           color = "#0aa0ff"
-
-        radius = 400 + int(cc*3)  # 400m～(CCに応じて拡大)
+        radius = 400 + int(cc*3)
         html = (f"<b>{muni}</b><br>CC: {cc} / recent:{recent}"
                 f"<br><span style='color:#555'>基礎リスク:{risk}（気象/時間帯/週末/月齢/2019）</span>"
                 f"<br><a href='{EHIME_POLICE_URL}' target='_blank'>出典: 県警速報</a>")
-        folium.Circle(
-            location=[lat0, lon0], radius=radius, color=color, fill=True, fill_opacity=0.25,
-            weight=2, popup=folium.Popup(html, max_width=320)
-        ).add_to(fg)
+        folium.Circle([lat0, lon0], radius=radius, color=color, fill=True, fill_opacity=0.25,
+                      weight=2, popup=folium.Popup(html, max_width=320)).add_to(fg)
         ranks.append((muni, cc, recent))
-
     fg.add_to(m)
     return sorted(ranks, key=lambda x: x[1], reverse=True)
 
@@ -573,15 +544,15 @@ def add_poi_layer(m: folium.Map, pois: list[dict]):
     fg.add_to(m)
 
 # ---------------------------
-# CSVアップロード（住所→座標） ※簡略：プレビューのみ本実装
+# CSVアップロード（住所→座標）
 # ---------------------------
 def geocode_address_rows(df: pd.DataFrame, addr_col: str, muni_col: str | None) -> pd.DataFrame:
-    # 簡略（必要に応じ前作同様のParquetキャッシュも可）
     res = []
     for _, r in df.iterrows():
         addr = str(r.get(addr_col,"")).strip()
         muni = str(r.get(muni_col,"")).strip() if (muni_col and muni_col in df.columns) else ""
-        if not addr: res.append({"lat": None, "lon": None}); continue
+        if not addr:
+            res.append({"lat": None, "lon": None}); continue
         q = f"愛媛県 {muni} {addr}".strip()
         lat, lon = nominatim_search(q)
         time.sleep(0.8)
@@ -599,14 +570,12 @@ def main():
     st.markdown(f"<h1 style='margin:0 0 8px 0;'>{APP_TITLE}</h1>", unsafe_allow_html=True)
     st.caption("クリックで地点選択 →『分析する』。SIBYLモードで“犯罪係数(CC)”を市町単位に可視化（速報と現在条件に基づく相対指標）。")
 
-    # state
     if "sel_lat" not in st.session_state: st.session_state.sel_lat = INIT_LAT
     if "sel_lon" not in st.session_state: st.session_state.sel_lon = INIT_LON
     if "last_snap" not in st.session_state: st.session_state.last_snap = None
     if "pois" not in st.session_state: st.session_state.pois = []
     if "user_geo_df" not in st.session_state: st.session_state.user_geo_df = None
 
-    # サイドバー
     with st.sidebar:
         st.markdown("### 設定")
         st.session_state.sel_lat = st.number_input("選択緯度", value=float(st.session_state.sel_lat), format="%.6f")
@@ -623,13 +592,11 @@ def main():
         st.write(f"- OpenWeather: {'✅' if OPENWEATHER_KEY else '—'}")
         st.write(f"- Gemini: {'✅' if GEMINI_KEY else '—'}")
 
-    # データ
     @st.cache_data(show_spinner=False)
     def _load2019():
         return load_all_crime_2019(DATA_GLOBS)
     all_df = _load2019()
 
-    # 地図（選択）
     st.markdown("<div class='card'>**地図：クリックで任意地点を選択（ドラッグ可）**</div>", unsafe_allow_html=True)
     fmap = render_map_selectable(st.session_state.sel_lat, st.session_state.sel_lon, st.session_state.last_snap)
     out = call_st_folium_with_fallback(fmap, height=540, key="map_select", return_last_clicked=True)
@@ -651,7 +618,6 @@ def main():
         st.session_state.sel_lat = INIT_LAT; st.session_state.sel_lon = INIT_LON
         st.session_state.last_snap = None; st.rerun()
 
-    # 実行
     if analyze:
         with st.spinner("解析中（気象・月齢・2019傾向…）"):
             now_dt = datetime.now(JST)
@@ -660,7 +626,6 @@ def main():
             snap = compute_risk_score(weather, now_dt, all_df, moon)
             st.session_state.last_snap = snap
 
-    # 結果/シビュラ
     snap = st.session_state.last_snap
     c1, c2 = st.columns([1,1])
 
@@ -670,7 +635,6 @@ def main():
         if snap:
             st.markdown(f"<div class='score-big' style='color:{snap['color']};'>{int(round(snap['score']))}</div>", unsafe_allow_html=True)
             st.markdown(f"<span class='badge'>{snap['level']}</span>", unsafe_allow_html=True)
-            # SIBYL数値（選択地点の参考CC）
             cc_local = compute_cc_from_risk_and_news(snap["score"], recent_count=0)
             st.write("")
             st.markdown("**SIBYL: 犯罪係数（参考・速報加点なし）**", unsafe_allow_html=True)
@@ -686,7 +650,6 @@ def main():
             for r in snap["reasons"]: st.write("・", r)
 
     with c2:
-        # SIBYLモード：市町ごとの犯罪係数可視化
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.markdown("**SIBYL：犯罪係数レイヤ（市町単位）**")
         fmap2 = folium.Map(location=[EHIME_CENTER_LAT, EHIME_CENTER_LON], zoom_start=9, tiles="cartodbdark_matter")
@@ -697,7 +660,10 @@ def main():
             with st.spinner("県警速報から最近の出現回数を推定…"):
                 muni_counts = fetch_police_muni_counts()
             now_dt = datetime.now(JST)
-            ranks = add_sybil_cc_layer(fmap2, muni_counts, now_dt, all_df or pd.DataFrame({"date":[]}))
+            # ←←← ここが修正点：DataFrameの真偽値評価を避ける
+            safe_all_df = all_df if (all_df is not None) else pd.DataFrame({"date": pd.to_datetime([])})
+            ranks = add_sybil_cc_layer(fmap2, muni_counts, now_dt, safe_all_df)
+
         add_2019_layer(fmap2, all_df)
         call_st_folium_with_fallback(fmap2, height=520, key="map_result", return_last_clicked=False)
         st.markdown("</div>", unsafe_allow_html=True)
@@ -710,7 +676,6 @@ def main():
                 st.markdown(f"{i}. **{muni}**  —  **{cc}** <span class='rank-pill'>{lvl}</span>  <span class='mute'>(速報:{rc})</span>", unsafe_allow_html=True)
             st.caption("※ CCは相対指標。速報ページの“記載頻度”を加点として使用し、断定を避けています。")
 
-    # CSVアップロード（簡略）
     st.markdown("<div class='card'>**CSVアップロード（住所→座標）**</div>", unsafe_allow_html=True)
     up = st.file_uploader("住所CSVを選択（UTF-8/CP932等自動判別）", type=["csv"])
     colu1, colu2, colu3 = st.columns([2,2,1])
@@ -731,7 +696,6 @@ def main():
         except Exception as e:
             st.error(f"CSV読込/ジオコーディングに失敗: {e}")
 
-    # 近傍POI
     st.markdown("<div class='card'>**近傍POI（Overpass）**</div>", unsafe_allow_html=True)
     pr = st.slider("探索半径[m]", 400, 3000, 1200, 100)
     colp1, colp2 = st.columns([1,3])
@@ -742,7 +706,6 @@ def main():
             st.session_state.pois = fetch_pois_overpass(st.session_state.sel_lat, st.session_state.sel_lon, pr)
         st.success(f"取得: {len(st.session_state.pois)} 件")
 
-    # フッター
     st.markdown("---")
     st.caption(
         "※ 県警速報の出現回数は“最近の記載頻度”の**近似指標**。個別事件の真偽・詳細は必ず出典を参照。"
