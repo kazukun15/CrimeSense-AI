@@ -1,12 +1,13 @@
-streamlit==1.37.1
-pandas==2.2.2
-numpy==1.26.4
-requests==2.32.3
-python-dateutil==2.9.0.post0
-streamlit-folium==0.21.0
-folium==0.16.0
-chardet==5.2.0
-google-generativeai==0.8.2   # 任意（Geminiを使う場合）
-protobuf>=4.25.3
-grpcio>=1.62.1
-typing-extensions>=4.12.2
+# Ehime Safety Platform (v5) — requirements.txt
+# 必須
+streamlit>=1.33
+streamlit-folium>=0.18.0
+folium>=0.15.1
+pandas>=2.0.0
+numpy>=1.24.0
+requests>=2.31.0
+chardet>=5.1.0
+
+# 任意（必要時のみアンコメント）
+# google-generativeai>=0.8.0   # Gemini を使う場合
+# beautifulsoup4>=4.12.0       # 追加のHTML解析が必要な場合
